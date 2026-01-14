@@ -1,0 +1,7 @@
+bin/
+iam-t1-exporter
+*.log
+.git/
+.gitignore
+README.md
+Makefile
