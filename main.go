@@ -23,6 +23,8 @@ type config struct {
 	sensorServiceID string
 	notifyCharID    string
 	channelSize     int
+	dbPath          string
+	vmEndpoint      string
 }
 
 type Reading struct {
@@ -49,33 +51,70 @@ type MQTTConfig struct {
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	cfg := config{
-		deviceAddr:      "62:00:A1:3F:B4:26",
+		deviceAddr:      getEnv("DEVICE_ADDR", "62:00:A1:3F:B4:26"),
 		sensorServiceID: "0000ffe0-0000-1000-8000-00805f9b34fb",
 		notifyCharID:    "0000ffe4-0000-1000-8000-00805f9b34fb",
 		channelSize:     1,
+		dbPath:          getEnv("DB_PATH", "./data/payloads.db"),
+		vmEndpoint:      getEnv("VM_ENDPOINT", ""),
 	}
-	// parse configs from env
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Initialize storage
+	storage, err := NewStorage(cfg.dbPath)
+	assert("storage init", err)
+	defer func() {
+		if err := storage.Close(); err != nil {
+			logger.Error("storage close failed", "error", err)
+		}
+	}()
+	logger.Info("storage initialized", "path", cfg.dbPath)
+
+	// Initialize MQTT
 	mqttConfig := MQTTConfig{
 		ClientID:  "inkbird-iam-t1_" + time.Now().UTC().Format(time.RFC3339),
 		ServerURL: os.Getenv("MQTT_SERVER"),
 		Username:  os.Getenv("MQTT_USERNAME"),
 		Password:  os.Getenv("MQTT_PASSWORD"),
 	}
-	mqtt, err := NewMQTT(context.Background(), mqttConfig, logger)
-	assert("mqtt", err)
-	defer func() {
-		assert("mqtt close", mqtt.Close())
-	}()
+	var mqtt *mqttSession
+	if mqttConfig.ServerURL != "" {
+		mqtt, err = NewMQTT(ctx, mqttConfig, logger)
+		assert("mqtt", err)
+		defer func() {
+			assert("mqtt close", mqtt.Close())
+		}()
+	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Initialize VM writer if configured
+	var vmWriter *VMWriter
+	if cfg.vmEndpoint != "" {
+		vmWriter = NewVMWriter(logger, cfg.vmEndpoint, storage)
+		defer func() {
+			if err := vmWriter.Close(); err != nil {
+				logger.Error("vm writer close failed", "error", err)
+			}
+		}()
+
+		// Trigger recovery by pushing 1 unsubmitted to rawPayloads
+		go func() {
+			payloads, err := storage.GetUnsubmitted(1)
+			if err != nil {
+				logger.Error("failed to get startup unsubmitted", "error", err)
+			} else if len(payloads) > 0 {
+				logger.Info("triggering recovery", "unsubmitted", "exists")
+			}
+		}()
+	}
 
 	// Registration
 	adapter := bluetooth.DefaultAdapter
 	assert("enable adapter", adapter.Enable())
 
-	readings := make(chan Reading, cfg.channelSize)
-	device := registerDevice(logger, adapter, cfg, readings)
+	rawPayloads := make(chan []byte, cfg.channelSize)
+	device := registerDevice(logger, adapter, cfg, rawPayloads)
 	defer func() {
 		logger.Info("disconnecting device")
 		if err := device.Disconnect(); err != nil {
@@ -84,7 +123,7 @@ func main() {
 	}()
 
 	// Normal operation
-	go collectReadings(ctx, logger, readings, *mqtt)
+	go processPayloads(ctx, logger, cfg.deviceAddr, storage, vmWriter, mqtt, rawPayloads)
 
 	// Shutdown handling
 	sig := make(chan os.Signal, 1)
@@ -94,19 +133,12 @@ func main() {
 	logger.Info("shutdown signal received")
 	cancel()
 
-	// Drain remaining readings
-	close(readings)
-	remaining := 0
-	for range readings {
-		remaining++
-	}
-	if remaining > 0 {
-		logger.Info("drained buffered readings", "count", remaining)
-	}
+	// Drain remaining
+	close(rawPayloads)
 	logger.Info("shutdown complete")
 }
 
-func registerDevice(log *slog.Logger, adapter *bluetooth.Adapter, cfg config, readings chan<- Reading) bluetooth.Device {
+func registerDevice(log *slog.Logger, adapter *bluetooth.Adapter, cfg config, rawPayloads chan<- []byte) bluetooth.Device {
 	log.Info("scanning for bluetooth device", "addr", cfg.deviceAddr)
 	ch := make(chan bluetooth.ScanResult, 1)
 
@@ -145,18 +177,14 @@ func registerDevice(log *slog.Logger, adapter *bluetooth.Adapter, cfg config, re
 
 			if char.UUID().String() == cfg.notifyCharID {
 				err = char.EnableNotifications(func(buf []byte) {
-					//TODO: discover whats on the first 3 bytes
-					someRaw := int16(buf[2])<<8 | int16(buf[3])
-					some := float32(someRaw) / 10.0
-					log.Info("bluetooth notification", "rawData", buf, "some", some)
-					if reading, ok := parseReading(buf); ok {
-						select {
-						case readings <- reading:
-						default:
-							log.Warn("readings channel full, dropping data")
-						}
-					} else {
-						log.Warn("parseReadin failed", "data", buf)
+					// Copy the buffer since it's reused
+					payload := make([]byte, len(buf))
+					copy(payload, buf)
+
+					select {
+					case rawPayloads <- payload:
+					default:
+						log.Warn("raw payloads channel full, dropping data")
 					}
 				})
 				assert("enable notifications", err)
@@ -166,24 +194,6 @@ func registerDevice(log *slog.Logger, adapter *bluetooth.Adapter, cfg config, re
 	}
 
 	return device
-}
-
-func collectReadings(ctx context.Context, log *slog.Logger, readings chan Reading, mqtt mqttSession) {
-	for {
-		select {
-		case <-ctx.Done():
-			log.Info("context done")
-			return
-		case reading := <-readings:
-			log.Info("received reading", "data", reading.String())
-			body, err := json.Marshal(reading)
-			if err != nil {
-				log.Error("json marshal failed", "error", err)
-			} else if err := mqtt.Publish(ctx, "inkbird-iam-t1/reading", body); err != nil {
-				log.Error("mqtt publish failed", "error", err)
-			}
-		}
-	}
 }
 
 func parseReading(data []byte) (Reading, bool) {
@@ -281,4 +291,68 @@ func (s *mqttSession) Publish(ctx context.Context, topic string, msg []byte) err
 			Payload: msg,
 		}},
 	)
+}
+
+func getEnv(key, defaultValue string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return defaultValue
+}
+
+func processPayloads(ctx context.Context, logger *slog.Logger, deviceAddr string, storage *Storage, vmWriter *VMWriter, mqtt *mqttSession, rawPayloads <-chan []byte) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Periodic VM submission
+			if vmWriter != nil {
+				vmWriter.DrainUnsubmitted(ctx)
+			}
+		case payload := <-rawPayloads:
+			reading, ok := parseReading(payload)
+			if !ok {
+				logger.Warn("failed to parse payload", "data", payload)
+				// Store raw even if parsing failed
+				if _, err := storage.SaveReading(deviceAddr, payload, nil); err != nil {
+					logger.Error("failed to save unparsed payload", "error", err)
+				}
+				continue
+			}
+
+			// Store raw + parsed
+			saved, err := storage.SaveReading(deviceAddr, payload, &reading)
+			if err != nil {
+				logger.Error("failed to save payload", "error", err)
+				continue
+			}
+
+			// Submit to VM
+			if vmWriter != nil {
+				result, err := vmWriter.WriteBatch(ctx, []StoredReading{saved})
+				if err != nil {
+					logger.Error("vm submit failed", "error", err)
+				} else if len(result.Written) > 0 {
+					if err := storage.MarkSubmitted(result.Written); err != nil {
+						logger.Error("failed to mark vm submitted", "error", err)
+					}
+				}
+			}
+
+			// Submit to MQTT
+			if mqtt != nil {
+				body, err := json.Marshal(reading)
+				if err != nil {
+					logger.Error("json marshal failed", "error", err)
+				} else if err := mqtt.Publish(ctx, "inkbird-iam-t1/reading", body); err != nil {
+					logger.Error("mqtt publish failed", "error", err)
+				}
+				// Note: MQTT doesn't mark as submitted since it's realtime only
+			}
+		}
+	}
 }
