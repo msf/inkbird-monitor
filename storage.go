@@ -244,3 +244,34 @@ func (s *Storage) markSubmittedBatch(ids []int64) error {
 func (s *Storage) Close() error {
 	return s.db.Close()
 }
+
+type StorageStats struct {
+	TotalReadings int64
+	LastReadingAt *time.Time
+}
+
+func (s *Storage) GetStats() (StorageStats, error) {
+	var stats StorageStats
+
+	// Get total count - SQLite optimizes COUNT(*) well
+	err := s.db.QueryRow("SELECT COUNT(*) FROM payloads").Scan(&stats.TotalReadings)
+	if err != nil {
+		return stats, fmt.Errorf("count readings: %w", err)
+	}
+
+	// Get last reading time - uses idx_received_at index
+	var lastReadingStr sql.NullString
+	err = s.db.QueryRow("SELECT received_at FROM payloads ORDER BY received_at DESC LIMIT 1").Scan(&lastReadingStr)
+	if err != nil && err != sql.ErrNoRows {
+		return stats, fmt.Errorf("get last reading: %w", err)
+	}
+
+	if lastReadingStr.Valid {
+		t, err := time.Parse(time.RFC3339Nano, lastReadingStr.String)
+		if err == nil {
+			stats.LastReadingAt = &t
+		}
+	}
+
+	return stats, nil
+}

@@ -59,6 +59,17 @@ func main() {
 		vmEndpoint:      getEnv("VM_ENDPOINT", ""),
 	}
 
+	// Print config at startup
+	logger.Info("starting inkbird-monitor",
+		"device_addr", cfg.deviceAddr,
+		"db_path", cfg.dbPath,
+		"vm_endpoint", cfg.vmEndpoint,
+		"mqtt_server", getEnv("MQTT_SERVER", ""),
+		"sensor_service", cfg.sensorServiceID,
+		"notify_char", cfg.notifyCharID,
+		"channel_size", cfg.channelSize,
+	)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -70,7 +81,26 @@ func main() {
 			logger.Error("storage close failed", "error", err)
 		}
 	}()
-	logger.Info("storage initialized", "path", cfg.dbPath)
+
+	// Print storage statistics
+	stats, err := storage.GetStats()
+	if err != nil {
+		logger.Warn("failed to get storage stats", "error", err)
+	} else {
+		if stats.LastReadingAt != nil {
+			logger.Info("storage initialized",
+				"path", cfg.dbPath,
+				"total_readings", stats.TotalReadings,
+				"last_reading", stats.LastReadingAt.Format(time.RFC3339),
+			)
+		} else {
+			logger.Info("storage initialized",
+				"path", cfg.dbPath,
+				"total_readings", stats.TotalReadings,
+				"last_reading", "none",
+			)
+		}
+	}
 
 	// Initialize MQTT
 	mqttConfig := MQTTConfig{
@@ -114,13 +144,9 @@ func main() {
 	assert("enable adapter", adapter.Enable())
 
 	rawPayloads := make(chan []byte, cfg.channelSize)
-	device := registerDevice(logger, adapter, cfg, rawPayloads)
-	defer func() {
-		logger.Info("disconnecting device")
-		if err := device.Disconnect(); err != nil {
-			logger.Error("disconnect failed", "error", err)
-		}
-	}()
+
+	// Maintain connection with retry loop
+	go maintainConnection(ctx, logger, adapter, cfg, rawPayloads)
 
 	// Normal operation
 	go processPayloads(ctx, logger, cfg.deviceAddr, storage, vmWriter, mqtt, rawPayloads)
@@ -138,39 +164,120 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-func registerDevice(log *slog.Logger, adapter *bluetooth.Adapter, cfg config, rawPayloads chan<- []byte) bluetooth.Device {
+func maintainConnection(ctx context.Context, logger *slog.Logger, adapter *bluetooth.Adapter, cfg config, rawPayloads chan<- []byte) {
+	backoff := time.Second
+	const maxBackoff = 60 * time.Second
+	attemptCount := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		attemptCount++
+		if attemptCount > 1 {
+			logger.Info("attempting reconnection", "attempt", attemptCount, "backoff", backoff)
+		}
+
+		device, err := connectDevice(ctx, logger, adapter, cfg, rawPayloads)
+		if err != nil {
+			logger.Error("connection failed", "attempt", attemptCount, "error", err, "retry_in", backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+				// Exponential backoff with cap
+				backoff = min(backoff*2, maxBackoff)
+			}
+			continue
+		}
+
+		// Connected successfully
+		logger.Info("connection established", "attempt", attemptCount)
+
+		// Wait for context cancellation (shutdown)
+		<-ctx.Done()
+		logger.Info("disconnecting device")
+		if err := device.Disconnect(); err != nil {
+			logger.Error("disconnect failed", "error", err)
+		}
+		return
+	}
+}
+
+func connectDevice(ctx context.Context, log *slog.Logger, adapter *bluetooth.Adapter, cfg config, rawPayloads chan<- []byte) (bluetooth.Device, error) {
 	log.Info("scanning for bluetooth device", "addr", cfg.deviceAddr)
 	ch := make(chan bluetooth.ScanResult, 1)
+	scanDone := make(chan error, 1)
 
-	err := adapter.Scan(func(adapter *bluetooth.Adapter, result bluetooth.ScanResult) {
-		if result.Address.String() == cfg.deviceAddr {
-			if err := adapter.StopScan(); err != nil {
-				log.Error("stop scan failed", "error", err)
+	go func() {
+		err := adapter.Scan(func(adapter *bluetooth.Adapter, result bluetooth.ScanResult) {
+			if result.Address.String() == cfg.deviceAddr {
+				if err := adapter.StopScan(); err != nil {
+					log.Error("stop scan failed", "error", err)
+				}
+				ch <- result
 			}
-			ch <- result
-		}
-	})
-	assert("scan", err)
+		})
+		scanDone <- err
+	}()
 
-	result := <-ch
+	var result bluetooth.ScanResult
+	select {
+	case <-ctx.Done():
+		log.Warn("scan cancelled by context")
+		_ = adapter.StopScan()
+		return bluetooth.Device{}, ctx.Err()
+	case err := <-scanDone:
+		if err != nil {
+			log.Error("scan failed", "error", err)
+			return bluetooth.Device{}, fmt.Errorf("scan: %w", err)
+		}
+		result = <-ch
+	case result = <-ch:
+		// Got result
+	}
+
 	log.Debug("found bluetooth device, connecting", "addr", result.Address)
 
 	device, err := adapter.Connect(result.Address, bluetooth.ConnectionParams{})
-	assert("connect", err)
+	if err != nil {
+		log.Error("failed to connect to device", "addr", result.Address, "error", err)
+		return bluetooth.Device{}, fmt.Errorf("connect: %w", err)
+	}
 	log.Info("connected to bluetooth device", "addr", result.Address)
 
+	if err := setupNotifications(ctx, log, device, cfg, rawPayloads); err != nil {
+		log.Error("failed to setup notifications", "error", err)
+		_ = device.Disconnect()
+		return bluetooth.Device{}, fmt.Errorf("setup notifications: %w", err)
+	}
+
+	return device, nil
+}
+
+func setupNotifications(ctx context.Context, log *slog.Logger, device bluetooth.Device, cfg config, rawPayloads chan<- []byte) error {
 	// Discover services
 	svcUUID := parseUUID(cfg.sensorServiceID)
 	services, err := device.DiscoverServices([]bluetooth.UUID{svcUUID})
-	assert("discover services", err)
+	if err != nil {
+		log.Error("service discovery failed", "service_uuid", cfg.sensorServiceID, "error", err)
+		return fmt.Errorf("discover services: %w", err)
+	}
+	log.Debug("discovered services", "count", len(services))
 
 	for _, service := range services {
 		log.Debug("discovered service", "uuid", service.UUID().String())
 
-		// TODO:what more to discover?
 		charUUID := parseUUID(cfg.notifyCharID)
 		chars, err := service.DiscoverCharacteristics([]bluetooth.UUID{charUUID})
-		assert("discover characteristics", err)
+		if err != nil {
+			log.Error("characteristic discovery failed", "service_uuid", service.UUID().String(), "error", err)
+			return fmt.Errorf("discover characteristics: %w", err)
+		}
+		log.Debug("discovered characteristics", "service_uuid", service.UUID().String(), "count", len(chars))
 
 		for _, char := range chars {
 			log.Info("discovered characteristic", "uuid", char.UUID().String())
@@ -183,17 +290,24 @@ func registerDevice(log *slog.Logger, adapter *bluetooth.Adapter, cfg config, ra
 
 					select {
 					case rawPayloads <- payload:
+					case <-ctx.Done():
+						return
 					default:
-						log.Warn("raw payloads channel full, dropping data")
+						log.Warn("raw payloads channel full, dropping notification", "size", len(buf))
 					}
 				})
-				assert("enable notifications", err)
+				if err != nil {
+					log.Error("failed to enable notifications", "characteristic", char.UUID().String(), "error", err)
+					return fmt.Errorf("enable notifications: %w", err)
+				}
 				log.Info("notifications enabled", "notification", char.UUID().String())
+				return nil
 			}
 		}
 	}
 
-	return device
+	log.Error("notification characteristic not found", "expected_uuid", cfg.notifyCharID)
+	return fmt.Errorf("notification characteristic %s not found", cfg.notifyCharID)
 }
 
 func parseReading(data []byte) (Reading, bool) {
@@ -353,6 +467,14 @@ func processPayloads(ctx context.Context, logger *slog.Logger, deviceAddr string
 				}
 				// Note: MQTT doesn't mark as submitted since it's realtime only
 			}
+
+			// Print reading to console after successful processing
+			logger.Info("reading",
+				"co2", reading.CO2,
+				"humidity", fmt.Sprintf("%.1f%%", reading.Humidity),
+				"pressure", reading.Pressure,
+				"temp", fmt.Sprintf("%.1fC", reading.Temperature),
+			)
 		}
 	}
 }
