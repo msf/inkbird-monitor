@@ -302,6 +302,15 @@ func connectDevice(ctx context.Context, log *slog.Logger, adapter *bluetooth.Ada
 	}
 	log.Info("connected to bluetooth device", "addr", result.Address)
 
+	// Wait for BLE connection to fully establish before attempting operations
+	// adapter.Connect() initiates connection but returns before handshake completes
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-ctx.Done():
+		_ = device.Disconnect()
+		return bluetooth.Device{}, ctx.Err()
+	}
+
 	if err := setupNotifications(ctx, log, device, cfg, rawPayloads); err != nil {
 		log.Error("failed to setup notifications", "error", err)
 		_ = device.Disconnect()
