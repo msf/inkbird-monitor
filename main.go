@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -145,11 +146,15 @@ func main() {
 
 	rawPayloads := make(chan []byte, cfg.channelSize)
 
+	// Track last reading time for connection health monitoring
+	var lastReadingTime atomic.Int64
+	lastReadingTime.Store(time.Now().Unix())
+
 	// Maintain connection with retry loop
-	go maintainConnection(ctx, logger, adapter, cfg, rawPayloads)
+	go maintainConnection(ctx, logger, adapter, cfg, rawPayloads, &lastReadingTime)
 
 	// Normal operation
-	go processPayloads(ctx, logger, cfg.deviceAddr, storage, vmWriter, mqtt, rawPayloads)
+	go processPayloads(ctx, logger, cfg.deviceAddr, storage, vmWriter, mqtt, rawPayloads, &lastReadingTime)
 
 	// Shutdown handling
 	sig := make(chan os.Signal, 1)
@@ -164,9 +169,10 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-func maintainConnection(ctx context.Context, logger *slog.Logger, adapter *bluetooth.Adapter, cfg config, rawPayloads chan<- []byte) {
+func maintainConnection(ctx context.Context, logger *slog.Logger, adapter *bluetooth.Adapter, cfg config, rawPayloads chan<- []byte, lastReadingTime *atomic.Int64) {
 	backoff := time.Second
 	const maxBackoff = 60 * time.Second
+	const staleTimeout = 10 * time.Minute
 	attemptCount := 0
 
 	for {
@@ -181,29 +187,76 @@ func maintainConnection(ctx context.Context, logger *slog.Logger, adapter *bluet
 			logger.Info("attempting reconnection", "attempt", attemptCount, "backoff", backoff)
 		}
 
-		device, err := connectDevice(ctx, logger, adapter, cfg, rawPayloads)
+		// Create a context for this connection that can be cancelled independently
+		connCtx, connCancel := context.WithCancel(ctx)
+
+		device, err := connectDevice(connCtx, logger, adapter, cfg, rawPayloads)
 		if err != nil {
+			connCancel()
 			logger.Error("connection failed", "attempt", attemptCount, "error", err, "retry_in", backoff)
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(backoff):
-				// Exponential backoff with cap
 				backoff = min(backoff*2, maxBackoff)
 			}
 			continue
 		}
 
-		// Connected successfully
+		// Connected successfully, reset backoff and attempt counter
 		logger.Info("connection established", "attempt", attemptCount)
+		backoff = time.Second
+		attemptCount = 0
 
-		// Wait for context cancellation (shutdown)
-		<-ctx.Done()
+		// Monitor connection health in background
+		go monitorConnectionHealth(connCtx, connCancel, logger, lastReadingTime, staleTimeout)
+
+		// Wait for disconnection signal (from health monitor) or shutdown
+		<-connCtx.Done()
+
+		// Cleanup device
 		logger.Info("disconnecting device")
 		if err := device.Disconnect(); err != nil {
 			logger.Error("disconnect failed", "error", err)
 		}
-		return
+
+		// If parent context is done (shutdown), exit
+		if ctx.Err() != nil {
+			return
+		}
+
+		// Otherwise, connection was stale or died - reconnect after backoff
+		logger.Warn("connection lost, will reconnect", "backoff", backoff)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+			backoff = min(backoff*2, maxBackoff)
+		}
+	}
+}
+
+func monitorConnectionHealth(ctx context.Context, cancel context.CancelFunc, logger *slog.Logger, lastReadingTime *atomic.Int64, staleTimeout time.Duration) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			lastSeen := time.Unix(lastReadingTime.Load(), 0)
+			staleDuration := time.Since(lastSeen)
+
+			if staleDuration > staleTimeout {
+				logger.Warn("no readings received, triggering reconnection",
+					"last_reading", lastSeen.Format(time.RFC3339),
+					"stale_duration", staleDuration.Round(time.Second),
+				)
+				cancel()
+				return
+			}
+		}
 	}
 }
 
@@ -414,7 +467,7 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-func processPayloads(ctx context.Context, logger *slog.Logger, deviceAddr string, storage *Storage, vmWriter *VMWriter, mqtt *mqttSession, rawPayloads <-chan []byte) {
+func processPayloads(ctx context.Context, logger *slog.Logger, deviceAddr string, storage *Storage, vmWriter *VMWriter, mqtt *mqttSession, rawPayloads <-chan []byte, lastReadingTime *atomic.Int64) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
@@ -428,6 +481,9 @@ func processPayloads(ctx context.Context, logger *slog.Logger, deviceAddr string
 				vmWriter.DrainUnsubmitted(ctx)
 			}
 		case payload := <-rawPayloads:
+			// Update last reading timestamp
+			lastReadingTime.Store(time.Now().Unix())
+
 			reading, ok := parseReading(payload)
 			if !ok {
 				logger.Warn("failed to parse payload", "data", payload)
