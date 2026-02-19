@@ -1,6 +1,6 @@
 module iam-t1-exporter
 
-go 1.25
+go 1.26
 
 require (
 	github.com/eclipse/paho.golang v0.23.0
