@@ -39,26 +39,26 @@ func (w *VMWriter) DrainUnsubmitted(ctx context.Context) {
 	for {
 		readings, err := w.storage.GetUnsubmitted(batchSize)
 		if err != nil {
-			w.logger.Error("failed to get unsubmitted during drain", "error", err)
+			w.logger.Error("DrainUnsubmitted: failed to get unsubmitted", "error", err)
 			return
 		}
 
 		if len(readings) == 0 {
 			if totalRecovered > 0 {
-				w.logger.Info("recovery complete", "total", totalRecovered)
+				w.logger.Info("DrainUnsubmitted: recovery complete", "total", totalRecovered)
 			}
 			return
 		}
 
 		result, err := w.WriteBatch(ctx, readings)
 		if err != nil {
-			w.logger.Warn("failed to write during drain", "error", err)
+			w.logger.Warn("DrainUnsubmitted: failed to write batch", "error", err)
 			return
 		}
 
 		if len(result.Written) > 0 {
 			if err := w.storage.MarkSubmitted(result.Written); err != nil {
-				w.logger.Error("failed to mark submitted during drain", "error", err)
+				w.logger.Error("DrainUnsubmitted: failed to mark submitted", "error", err)
 				return
 			}
 			totalRecovered += len(result.Written)
@@ -67,7 +67,7 @@ func (w *VMWriter) DrainUnsubmitted(ctx context.Context) {
 		// If we got less than batch size, we're done
 		if len(readings) < int(batchSize) {
 			if totalRecovered > 0 {
-				w.logger.Info("recovery complete", "total", totalRecovered)
+				w.logger.Info("DrainUnsubmitted: recovery complete", "total", totalRecovered)
 			}
 			return
 		}
@@ -140,6 +140,7 @@ func (w *VMWriter) WriteBatch(ctx context.Context, readings []StoredReading) (Wr
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
+		w.logger.Error("WriteBatch: VictoriaMetrics returned error", "status", resp.StatusCode, "body", string(body))
 		return WriteResult{}, fmt.Errorf("vm returned status %d: %s", resp.StatusCode, body)
 	}
 
