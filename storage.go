@@ -106,7 +106,7 @@ func (s *Storage) SaveReading(deviceAddr string, payload []byte, reading *Readin
 		temp,
 	)
 	if err != nil {
-		return StoredReading{}, err
+		return StoredReading{}, fmt.Errorf("save reading: %w", err)
 	}
 
 	id, err := result.LastInsertId()
@@ -222,23 +222,26 @@ func (s *Storage) MarkSubmitted(ids []int64) error {
 func (s *Storage) markSubmittedBatch(ids []int64) error {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return fmt.Errorf("begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	stmt, err := tx.Prepare("UPDATE payloads SET submitted = 1 WHERE id = ?")
 	if err != nil {
-		return err
+		return fmt.Errorf("prepare statement: %w", err)
 	}
 	defer func() { _ = stmt.Close() }()
 
 	for _, id := range ids {
 		if _, err := stmt.Exec(id); err != nil {
-			return err
+			return fmt.Errorf("exec update for id %d: %w", id, err)
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
 }
 
 func (s *Storage) Close() error {
