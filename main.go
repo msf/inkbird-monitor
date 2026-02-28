@@ -287,8 +287,10 @@ func monitorConnectionHealth(ctx context.Context, cancel context.CancelFunc, log
 }
 
 func connectDevice(ctx context.Context, log *slog.Logger, adapter *bluetooth.Adapter, deviceAddr string, rawPayloads chan<- []byte) (bluetooth.Device, error) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
+	// Timeout for scan+connect+discovery. Must NOT be used for the notification
+	// callback — that needs the parent ctx which lives for the connection lifetime.
+	opCtx, opCancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer opCancel()
 
 	log.Info("scanning for device", "addr", deviceAddr)
 
@@ -317,9 +319,9 @@ func connectDevice(ctx context.Context, log *slog.Logger, adapter *bluetooth.Ada
 
 	var sr scanResult
 	select {
-	case <-ctx.Done():
+	case <-opCtx.Done():
 		_ = adapter.StopScan()
-		return bluetooth.Device{}, ctx.Err()
+		return bluetooth.Device{}, opCtx.Err()
 	case sr = <-ch:
 		if sr.err != nil {
 			return bluetooth.Device{}, fmt.Errorf("scan: %w", sr.err)
@@ -335,11 +337,12 @@ func connectDevice(ctx context.Context, log *slog.Logger, adapter *bluetooth.Ada
 	// BLE handshake settle time — Connect() returns before handshake completes
 	select {
 	case <-time.After(500 * time.Millisecond):
-	case <-ctx.Done():
+	case <-opCtx.Done():
 		_ = device.Disconnect()
-		return bluetooth.Device{}, ctx.Err()
+		return bluetooth.Device{}, opCtx.Err()
 	}
 
+	// Parent ctx for notification callback — lives for the connection lifetime
 	if err := setupNotifications(ctx, log, device, rawPayloads); err != nil {
 		_ = device.Disconnect()
 		return bluetooth.Device{}, fmt.Errorf("setup notifications: %w", err)
