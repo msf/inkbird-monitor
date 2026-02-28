@@ -12,8 +12,10 @@ lint: bin/golangci-lint
 	bin/golangci-lint run ./...
 	go mod tidy
 
-bin/golangci-lint: bin
-	GOBIN=$(PWD)/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.8.0
+GOLANGCI_LINT_VERSION := v2.10.1
+
+bin/golangci-lint: Makefile | bin
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b bin $(GOLANGCI_LINT_VERSION)
 
 bin:
 	mkdir -p bin
