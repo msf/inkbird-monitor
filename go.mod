@@ -1,4 +1,4 @@
-module iam-t1-exporter
+module github.com/msf/inkbird-monitor
 
 go 1.26
 
