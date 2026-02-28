@@ -426,7 +426,9 @@ func NewMQTT(ctx context.Context, config MQTTConfig, log *slog.Logger) (*mqttSes
 		OnConnectionUp: func(cm *autopaho.ConnectionManager, connAck *paho.Connack) {
 			log.Info("mqtt: connection up", "server", config.ServerURL)
 		},
-		OnConnectError: func(err error) { log.Error("publish: error whilst attempting connection", "error", err) },
+		OnConnectError: func(err error) {
+			log.Error("mqtt: connect failed", "server", config.ServerURL, "client_id", config.ClientID, "error", err)
+		},
 		// TODO: how do I just use slog here?
 		// Errors:         logger{prefix: "publish"},
 		// Debug:          logger{prefix: "publish: debug"},
@@ -435,12 +437,12 @@ func NewMQTT(ctx context.Context, config MQTTConfig, log *slog.Logger) (*mqttSes
 		// eclipse/paho.golang/paho provides base mqtt functionality, the below config will be passed in for each connection
 		ClientConfig: paho.ClientConfig{
 			ClientID:      config.ClientID,
-			OnClientError: func(err error) { log.Error("publish: client error", "error", err) },
+			OnClientError: func(err error) { log.Error("mqtt: client error", "error", err) },
 			OnServerDisconnect: func(d *paho.Disconnect) {
 				if d.Properties != nil {
-					log.Info("publish: server requested disconnect", "reason", d.Properties.ReasonString)
+					log.Info("mqtt: server requested disconnect", "reason", d.Properties.ReasonString)
 				} else {
-					log.Info("publish: server requested disconnect", "reason", d.ReasonCode)
+					log.Info("mqtt: server requested disconnect", "reason", d.ReasonCode)
 				}
 			},
 		},
