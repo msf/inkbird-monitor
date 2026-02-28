@@ -1,10 +1,11 @@
-all: lint test build
+all: lint test inkbird-monitor
+.PHONY: all test lint setup image-build clean
 
 test: lint
 	go test -timeout=10s -cover -race -bench=. -benchmem ./...
 
-build:
-	CGO_ENABLED=0 go build -ldflags="-w -s" -o iam-t1-exporter .
+inkbird-monitor: main.go go.mod Makefile
+	CGO_ENABLED=0 go build -ldflags="-w -s" -o inkbird-monitor .
 
 lint: bin/golangci-lint
 	go fmt ./...
@@ -24,9 +25,8 @@ setup: bin/golangci-lint
 	go mod download
 
 image-build:
-	docker build -t iam-t1-exporter .
+	docker build -t inkbird-monitor .
 
 clean:
-	rm -rf bin iam-t1-exporter
+	rm -rf bin inkbird-monitor
 
-.PHONY: all test build lint setup image-build clean
